@@ -4,12 +4,16 @@ import shutil
 import sys
 import tempfile
 import random
+import json
+import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 from numbers_parser import Document
 from openpyxl import load_workbook
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +32,83 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class AnswerJudgeWorker(QObject):
+    finished = Signal(object, str)
+
+    def __init__(self, word: str, explanation: str, answer: str) -> None:
+        super().__init__()
+        self.word = word
+        self.explanation = explanation
+        self.answer = answer
+
+    def run(self) -> None:
+        api_key = "your_api_key_here"
+        if not api_key:
+            self.finished.emit(False, "DEEPSEEK_API_KEY is not set.")
+            return
+
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Judge whether a student's Chinese definition matches the reference "
+                        "meaning. Accept synonyms, natural paraphrases, and minor typos. "
+                        "Reject unrelated or materially incorrect meanings. Return JSON only "
+                        "with boolean 'correct' and short Chinese string 'reason'."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "word": self.word,
+                            "reference_definition": self.explanation,
+                            "student_answer": self.answer,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            content = result["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            judgment = json.loads(content)
+            correct = judgment["correct"]
+            reason = str(judgment.get("reason", ""))
+            if not isinstance(correct, bool):
+                raise ValueError("The API returned a non-boolean correctness value.")
+        except urllib.error.HTTPError as error:
+            try:
+                details = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                details = str(error)
+            self.finished.emit(None, f"DeepSeek HTTP {error.code}: {details}")
+            return
+        except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as error:
+            self.finished.emit(None, f"Could not judge the answer: {error}")
+            return
+        self.finished.emit(correct, reason)
 
 
 class SpreadsheetWindow(QMainWindow):
@@ -228,11 +309,18 @@ class SpreadsheetWindow(QMainWindow):
         if not entries:
             return
 
-        self._show_practice_window(random.choice(entries))
+        random.shuffle(entries)
+        self.practice_entries = entries
+        self.practice_incorrect_entries: list[tuple[str, str]] = []
+        self.practice_error_counts = {entry: 0 for entry in entries}
+        self.practice_index = 0
+        self.practice_attempts = 0
+        self.practice_reviewing = False
+        self._show_practice_window(self.practice_entries[0])
         self.menuBar().hide()
 
     def _show_practice_window(self, entry: tuple[str, str]) -> None:
-        word, _ = entry
+        word, explanation = entry
         practice_widget = QWidget()
         practice_layout = QVBoxLayout(practice_widget)
         practice_layout.setContentsMargins(34, 28, 34, 28)
@@ -251,29 +339,179 @@ class SpreadsheetWindow(QMainWindow):
         answer_box = QLineEdit()
         answer_box.setPlaceholderText("Enter the Chinese definition")
         answer_box.setObjectName("answerBox")
+        answer_box.setInputMethodHints(Qt.InputMethodHint.ImhNone)
         answer_box.setFixedSize(460, 90)
         practice_layout.addWidget(answer_box, 0, Qt.AlignmentFlag.AlignHCenter)
+        result_label = QLabel("")
+        result_label.setObjectName("statusLabel")
+        result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        result_label.setWordWrap(True)
+        practice_layout.addWidget(result_label)
         practice_layout.addStretch(1)
 
         action_row = QHBoxLayout()
         action_row.addStretch()
         ok_button = QPushButton("OK")
         ok_button.setObjectName("goButton")
-        ok_button.clicked.connect(lambda: self._submit_answer(answer_box, ok_button))
+        ok_button.clicked.connect(
+            lambda: self._submit_answer(word, explanation, answer_box, ok_button)
+        )
+        answer_box.returnPressed.connect(ok_button.click)
         action_row.addWidget(ok_button)
         practice_layout.addLayout(action_row)
 
         self.setCentralWidget(practice_widget)
         self.practice_widget = practice_widget
+        self.practice_word_label = word_label
+        self.practice_word_display = word_display
         self.answer_box = answer_box
-        answer_box.setFocus()
+        self.ok_button = ok_button
+        self.result_label = result_label
+        answer_box.setFocus(Qt.FocusReason.OtherFocusReason)
+        answer_box.activateWindow()
 
     def _submit_answer(
-        self, answer_box: QLineEdit, ok_button: QPushButton
+        self, word: str, explanation: str, answer_box: QLineEdit, ok_button: QPushButton
     ) -> None:
+        answer = answer_box.text().strip()
+        if not answer:
+            self.result_label.setText("Enter an answer first")
+            return
+        self.practice_attempts += 1
         answer_box.setReadOnly(True)
-        ok_button.setText("Submitted")
+        ok_button.setText("Judging...")
         ok_button.setEnabled(False)
+        self.result_label.setText("Checking your answer...")
+
+        thread = QThread(self)
+        worker = AnswerJudgeWorker(word, explanation, answer)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._handle_judgment, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.answer_judge_thread = thread
+        self.answer_judge_worker = worker
+        self.answer_judge_context = (answer_box, ok_button, thread, worker)
+        thread.start()
+
+    @Slot(object, str)
+    def _handle_judgment(self, correct: object, reason: str) -> None:
+        context = getattr(self, "answer_judge_context", None)
+        if context is None:
+            return
+        answer_box, ok_button, thread, worker = context
+        self._show_judgment(
+            correct, reason, answer_box, ok_button, thread, worker
+        )
+        thread.quit()
+
+    def _show_judgment(
+        self,
+        correct: object,
+        reason: str,
+        answer_box: QLineEdit,
+        ok_button: QPushButton,
+        thread: QThread,
+        worker: AnswerJudgeWorker,
+    ) -> None:
+        if correct is None:
+            answer_box.setReadOnly(False)
+            answer_box.setStyleSheet("border: 2px solid #c85132;")
+            ok_button.setText("Try again")
+            ok_button.setEnabled(True)
+            self.result_label.setText(reason)
+            return
+
+        answer_box.setReadOnly(False)
+        answer_box.setStyleSheet(
+            "border: 2px solid #3a8f62;" if correct else "border: 2px solid #c85132;"
+        )
+        if correct:
+            self.result_label.setText(reason or "Correct")
+            self._advance_after_answer(answer_box, ok_button, thread, worker)
+        else:
+            entry = self.practice_entries[self.practice_index]
+            self.practice_error_counts[entry] += 1
+            if self.practice_attempts < 2:
+                answer_box.setReadOnly(False)
+                answer_box.clear()
+                answer_box.setStyleSheet("border: 2px solid #c85132;")
+                answer_box.setFocus(Qt.FocusReason.OtherFocusReason)
+                ok_button.setText("Try again")
+                ok_button.setEnabled(True)
+                self.result_label.setText("Incorrect. One attempt left.")
+                return
+
+            if entry not in self.practice_incorrect_entries:
+                self.practice_incorrect_entries.append(entry)
+            answer_box.setReadOnly(True)
+            ok_button.setText("Next")
+            ok_button.setEnabled(True)
+            try:
+                ok_button.clicked.disconnect()
+            except RuntimeError:
+                pass
+            ok_button.clicked.connect(self._show_next_practice_entry)
+            self.result_label.setText(f"Incorrect twice. Correct answer: {entry[1]}")
+        thread.finished.connect(lambda: self._release_judge_references(worker))
+
+    def _advance_after_answer(
+        self,
+        answer_box: QLineEdit,
+        ok_button: QPushButton,
+        thread: QThread,
+        worker: AnswerJudgeWorker,
+    ) -> None:
+        QTimer.singleShot(
+            900,
+            self._show_next_practice_entry,
+        )
+
+    def _show_next_practice_entry(self) -> None:
+        self.practice_index += 1
+        if self.practice_index >= len(self.practice_entries):
+            if self.practice_incorrect_entries:
+                self.practice_entries = self.practice_incorrect_entries
+                self.practice_incorrect_entries = []
+                self.practice_index = 0
+                self.practice_reviewing = True
+            else:
+                self._finish_practice()
+                return
+
+        self.practice_attempts = 0
+        self._show_practice_window(self.practice_entries[self.practice_index])
+
+    def _finish_practice(self) -> None:
+        self.answer_box.setReadOnly(True)
+        self.ok_button.setText("Finish")
+        self.ok_button.setEnabled(True)
+        try:
+            self.ok_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self.ok_button.clicked.connect(self._show_statistics)
+        self.result_label.setText("Test complete. Click Finish to see your results.")
+
+    def _show_statistics(self) -> None:
+        statistics = "\n".join(
+            f"{entry[0]}: {count} incorrect"
+            for entry, count in self.practice_error_counts.items()
+        )
+        self.practice_word_label.hide()
+        self.practice_word_display.hide()
+        self.answer_box.hide()
+        self.ok_button.setText("Finished")
+        self.ok_button.setEnabled(False)
+        self.result_label.setStyleSheet("font-size: 20px; font-weight: 600;")
+        self.result_label.setText(f"Finished\n\n{statistics}")
+
+    def _release_judge_references(self, worker: AnswerJudgeWorker) -> None:
+        if getattr(self, "answer_judge_worker", None) is worker:
+            self.answer_judge_worker = None
+            self.answer_judge_thread = None
+            self.answer_judge_context = None
 
     def _set_go_file_state(self, has_file: bool) -> None:
         self.go_button.setProperty("hasFile", has_file)
