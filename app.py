@@ -5,6 +5,7 @@ import sys
 import tempfile
 import random
 import json
+import html
 import os
 import urllib.error
 import urllib.request
@@ -312,6 +313,7 @@ class SpreadsheetWindow(QMainWindow):
         random.shuffle(entries)
         self.practice_entries = entries
         self.practice_incorrect_entries: list[tuple[str, str]] = []
+        self.practice_given_up_entries: list[tuple[str, str]] = []
         self.practice_error_counts = {entry: 0 for entry in entries}
         self.practice_index = 0
         self.practice_attempts = 0
@@ -350,6 +352,10 @@ class SpreadsheetWindow(QMainWindow):
         practice_layout.addStretch(1)
 
         action_row = QHBoxLayout()
+        give_up_button = QPushButton("Give up")
+        give_up_button.setObjectName("goButton")
+        give_up_button.clicked.connect(self._give_up_current_word)
+        action_row.addWidget(give_up_button)
         action_row.addStretch()
         ok_button = QPushButton("OK")
         ok_button.setObjectName("goButton")
@@ -366,6 +372,7 @@ class SpreadsheetWindow(QMainWindow):
         self.practice_word_display = word_display
         self.answer_box = answer_box
         self.ok_button = ok_button
+        self.give_up_button = give_up_button
         self.result_label = result_label
         answer_box.setFocus(Qt.FocusReason.OtherFocusReason)
         answer_box.activateWindow()
@@ -483,29 +490,56 @@ class SpreadsheetWindow(QMainWindow):
         self.practice_attempts = 0
         self._show_practice_window(self.practice_entries[self.practice_index])
 
+    def _give_up_current_word(self) -> None:
+        entry = self.practice_entries[self.practice_index]
+        if entry not in self.practice_given_up_entries:
+            self.practice_given_up_entries.append(entry)
+        self._show_next_practice_entry()
+
     def _finish_practice(self) -> None:
-        self.answer_box.setReadOnly(True)
+        self._show_statistics()
+
+    def _show_statistics(self) -> None:
+        statistics = "\n".join(
+            f"{html.escape(entry[0])}: {count} incorrect"
+            for entry, count in self.practice_error_counts.items()
+        )
+        given_up = "\n".join(
+            f'<span style="color: #c85132;">{html.escape(entry[0])}</span>'
+            for entry in self.practice_given_up_entries
+        )
+        report = f"Finished\n\n{statistics}"
+        if given_up:
+            report += f"\n\nGiven up\n{given_up}"
+        self.practice_word_label.hide()
+        self.practice_word_display.hide()
+        self.answer_box.hide()
         self.ok_button.setText("Finish")
         self.ok_button.setEnabled(True)
         try:
             self.ok_button.clicked.disconnect()
         except RuntimeError:
             pass
-        self.ok_button.clicked.connect(self._show_statistics)
-        self.result_label.setText("Test complete. Click Finish to see your results.")
-
-    def _show_statistics(self) -> None:
-        statistics = "\n".join(
-            f"{entry[0]}: {count} incorrect"
-            for entry, count in self.practice_error_counts.items()
-        )
-        self.practice_word_label.hide()
-        self.practice_word_display.hide()
-        self.answer_box.hide()
-        self.ok_button.setText("Finished")
-        self.ok_button.setEnabled(False)
+        self.ok_button.clicked.connect(self._return_to_start)
         self.result_label.setStyleSheet("font-size: 20px; font-weight: 600;")
-        self.result_label.setText(f"Finished\n\n{statistics}")
+        self.result_label.setTextFormat(Qt.TextFormat.RichText)
+        self.result_label.setText(report.replace("\n", "<br>"))
+
+    def _return_to_start(self) -> None:
+        if self.current_path is not None:
+            try:
+                self.current_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.current_path = None
+        self.words_table.setRowCount(0)
+        self.words_label.setText("Words")
+        self.file_label.setText("No file uploaded")
+        self.storage_label.setText("Uploaded files are removed when you close WR.")
+        self.status_label.setText("Ready")
+        self._set_go_file_state(False)
+        self.setCentralWidget(self.content_widget)
+        self.menuBar().show()
 
     def _release_judge_references(self, worker: AnswerJudgeWorker) -> None:
         if getattr(self, "answer_judge_worker", None) is worker:
