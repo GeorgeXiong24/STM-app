@@ -1,0 +1,3 @@
+PySide6>=6.7
+numbers-parser>=4.19
+openpyxl>=3.1
