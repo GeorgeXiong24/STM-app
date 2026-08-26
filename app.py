@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import random
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QHeaderView,
+    QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -152,6 +155,8 @@ class SpreadsheetWindow(QMainWindow):
             #fileLabel { color: #3f413d; font: 600 14px 'Avenir Next'; padding: 2px 0; }
             #wordsLabel { color: #353633; font: 600 16px 'Avenir Next'; padding-top: 4px; }
             #wordsTable { border: 1px solid #e1ddd4; border-radius: 6px; background: #fffdf9; font: 14px 'Avenir Next'; }
+            #practiceWord { border: 1px solid #e1ddd4; border-radius: 8px; background: #fffdf9; font: 700 34px 'Avenir Next'; }
+            #answerBox { border: 1px solid #c9c1b5; border-radius: 6px; background: #fffdf9; padding: 10px; font: 700 20px 'Avenir Next'; }
         """)
 
     def choose_file(self) -> None:
@@ -214,8 +219,61 @@ class SpreadsheetWindow(QMainWindow):
             message_box.show()
             QTimer.singleShot(1500, message_box.accept)
             return
-        self.content_widget.hide()
+        entries = [
+            (word_item.text(), explanation_item.text())
+            for row in range(self.words_table.rowCount())
+            if (word_item := self.words_table.item(row, 0)) is not None
+            and (explanation_item := self.words_table.item(row, 1)) is not None
+        ]
+        if not entries:
+            return
+
+        self._show_practice_window(random.choice(entries))
         self.menuBar().hide()
+
+    def _show_practice_window(self, entry: tuple[str, str]) -> None:
+        word, _ = entry
+        practice_widget = QWidget()
+        practice_layout = QVBoxLayout(practice_widget)
+        practice_layout.setContentsMargins(34, 28, 34, 28)
+        practice_layout.setSpacing(20)
+
+        word_label = QLabel("Word")
+        word_label.setObjectName("wordsLabel")
+        word_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        practice_layout.addWidget(word_label)
+        word_display = QLabel(word)
+        word_display.setObjectName("practiceWord")
+        word_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        word_display.setFixedSize(560, 150)
+        practice_layout.addWidget(word_display, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        answer_box = QLineEdit()
+        answer_box.setPlaceholderText("Enter the Chinese definition")
+        answer_box.setObjectName("answerBox")
+        answer_box.setFixedSize(460, 90)
+        practice_layout.addWidget(answer_box, 0, Qt.AlignmentFlag.AlignHCenter)
+        practice_layout.addStretch(1)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        ok_button = QPushButton("OK")
+        ok_button.setObjectName("goButton")
+        ok_button.clicked.connect(lambda: self._submit_answer(answer_box, ok_button))
+        action_row.addWidget(ok_button)
+        practice_layout.addLayout(action_row)
+
+        self.setCentralWidget(practice_widget)
+        self.practice_widget = practice_widget
+        self.answer_box = answer_box
+        answer_box.setFocus()
+
+    def _submit_answer(
+        self, answer_box: QLineEdit, ok_button: QPushButton
+    ) -> None:
+        answer_box.setReadOnly(True)
+        ok_button.setText("Submitted")
+        ok_button.setEnabled(False)
 
     def _set_go_file_state(self, has_file: bool) -> None:
         self.go_button.setProperty("hasFile", has_file)
