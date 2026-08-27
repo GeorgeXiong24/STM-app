@@ -7,6 +7,7 @@ import random
 import json
 import html
 import os
+import ssl
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -44,8 +45,41 @@ class AnswerJudgeWorker(QObject):
         self.explanation = explanation
         self.answer = answer
 
+    @staticmethod
+    def _build_ssl_context(base_url: str) -> ssl.SSLContext:
+        verify_ssl = os.environ.get("DEEPSEEK_VERIFY_SSL", "true").lower()
+        should_verify = verify_ssl not in {"0", "false", "no", "off"}
+
+        if should_verify:
+            return ssl.create_default_context()
+
+        return ssl._create_unverified_context()
+
+    @staticmethod
+    def _is_certificate_error(error: BaseException) -> bool:
+        message = str(error).lower()
+        return (
+            "certificate verify failed" in message
+            or "self-signed certificate" in message
+            or "ssl: cert" in message
+            or "unable to get local issuer certificate" in message
+        )
+
+    def _send_judgment_request(self, request: urllib.request.Request, ssl_context: ssl.SSLContext):
+        with urllib.request.urlopen(request, timeout=30, context=ssl_context) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        content = result["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        judgment = json.loads(content)
+        correct = judgment["correct"]
+        reason = str(judgment.get("reason", ""))
+        if not isinstance(correct, bool):
+            raise ValueError("The API returned a non-boolean correctness value.")
+        return correct, reason
+
     def run(self) -> None:
-        api_key = "your_api_key_here"
+        api_key = "sk-23c4c5238b7646f486855c5bed742e04"
         if not api_key:
             self.finished.emit(False, "DEEPSEEK_API_KEY is not set.")
             return
@@ -88,17 +122,9 @@ class AnswerJudgeWorker(QObject):
             },
             method="POST",
         )
+        ssl_context = self._build_ssl_context(base_url)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            content = result["choices"][0]["message"]["content"].strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            judgment = json.loads(content)
-            correct = judgment["correct"]
-            reason = str(judgment.get("reason", ""))
-            if not isinstance(correct, bool):
-                raise ValueError("The API returned a non-boolean correctness value.")
+            correct, reason = self._send_judgment_request(request, ssl_context)
         except urllib.error.HTTPError as error:
             try:
                 details = error.read().decode("utf-8", errors="replace")
@@ -106,7 +132,26 @@ class AnswerJudgeWorker(QObject):
                 details = str(error)
             self.finished.emit(None, f"DeepSeek HTTP {error.code}: {details}")
             return
-        except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as error:
+        except urllib.error.URLError as error:
+            if self._is_certificate_error(error):
+                try:
+                    correct, reason = self._send_judgment_request(request, ssl._create_unverified_context())
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError, ssl.SSLError) as retry_error:
+                    self.finished.emit(None, f"Could not judge the answer: {retry_error}")
+                    return
+                self.finished.emit(correct, reason)
+                return
+            self.finished.emit(None, f"Could not judge the answer: {error}")
+            return
+        except (TimeoutError, KeyError, IndexError, ValueError, ssl.SSLError) as error:
+            if self._is_certificate_error(error):
+                try:
+                    correct, reason = self._send_judgment_request(request, ssl._create_unverified_context())
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError, ssl.SSLError) as retry_error:
+                    self.finished.emit(None, f"Could not judge the answer: {retry_error}")
+                    return
+                self.finished.emit(correct, reason)
+                return
             self.finished.emit(None, f"Could not judge the answer: {error}")
             return
         self.finished.emit(correct, reason)
