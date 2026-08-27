@@ -7,15 +7,61 @@ import random
 import json
 import html
 import os
+import subprocess
 import ssl
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+
+REQUIRED_PACKAGES = (
+    "PySide6>=6.7",
+    "numbers-parser>=4.19",
+    "openpyxl>=3.1",
+)
+
+
+def _ensure_runtime_environment() -> None:
+    if sys.prefix != sys.base_prefix:
+        return
+
+    project_directory = Path(__file__).resolve().parent
+    environment_directory = project_directory / ".venv"
+    environment_python = environment_directory / "bin" / "python"
+
+    try:
+        if not environment_python.exists():
+            subprocess.check_call(
+                [sys.executable, "-m", "venv", str(environment_directory)]
+            )
+        subprocess.check_call(
+            [
+                str(environment_python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                *REQUIRED_PACKAGES,
+            ]
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(
+            "WR could not prepare its Python environment. "
+            "Please check that Python 3.10+ and an internet connection are available.\n"
+            f"Details: {error}"
+        ) from error
+
+    os.execv(str(environment_python), [str(environment_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+_ensure_runtime_environment()
+
 from numbers_parser import Document
 from openpyxl import load_workbook
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+
+key = ""
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,6 +75,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -79,7 +126,7 @@ class AnswerJudgeWorker(QObject):
         return correct, reason
 
     def run(self) -> None:
-        api_key = "your_api_key_here"
+        api_key = (key or "").strip()
         if not api_key:
             self.finished.emit(False, "DEEPSEEK_API_KEY is not set.")
             return
@@ -165,12 +212,13 @@ class SpreadsheetWindow(QMainWindow):
         self.setWindowTitle("WR")
         self.setMinimumSize(900, 760)
         self.resize(1180, 980)
+        self.key = ""
         self._build_ui()
         self._apply_styles()
+        self._show_key_entry_screen()
 
     def _build_ui(self) -> None:
         self.content_widget = QWidget()
-        self.setCentralWidget(self.content_widget)
         root = QVBoxLayout(self.content_widget)
         root.setContentsMargins(34, 28, 34, 28)
         root.setSpacing(20)
@@ -259,6 +307,112 @@ class SpreadsheetWindow(QMainWindow):
         open_action.triggered.connect(self.choose_file)
         file_menu.addAction(open_action)
 
+    def _show_key_entry_screen(self) -> None:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(180, 220, 180, 200)
+        layout.setSpacing(18)
+
+        title = QLabel("Hi! This is WR by George Xiong.")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        row = QHBoxLayout()
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Please input the key")
+        self.key_input.setObjectName("answerBox")
+        self.key_input.setMinimumWidth(620)
+        self.key_input.setFixedHeight(60)
+        self.key_input.returnPressed.connect(self._submit_key)
+        row.addWidget(self.key_input)
+
+        self.key_button = QPushButton("OK")
+        self.key_button.setObjectName("primaryButton")
+        self.key_button.clicked.connect(self._submit_key)
+        row.addWidget(self.key_button)
+        layout.addLayout(row)
+
+        self.setCentralWidget(widget)
+        self.key_input.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _show_standard_alert(self, title: str, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(message)
+        warning_icon = box.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        warning_pixmap = warning_icon.pixmap(140, 140).scaled(
+            140,
+            140,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        box.setIconPixmap(warning_pixmap)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setStyleSheet("""
+            QMessageBox {
+                background: #f6f5f1;
+                border: 1px solid #e1ddd4;
+                border-radius: 12px;
+                min-width: 420px;
+            }
+            QMessageBox QLabel {
+                color: #20211f;
+                font: 500 15px 'Avenir Next';
+                margin: 0px;
+            }
+            QMessageBox QPushButton {
+                background: #c85132;
+                color: white;
+                border: 0;
+                border-radius: 6px;
+                padding: 10px 22px;
+                min-width: 90px;
+                font: 600 13px 'Avenir Next';
+            }
+            QMessageBox QPushButton:hover {
+                background: #ad4127;
+            }
+            QMessageBox > QPushButton {
+                margin-top: 12px;
+            }
+            QMessageBox::icon {
+                width: 140px;
+                min-width: 140px;
+                max-width: 140px;
+                height: 140px;
+                min-height: 140px;
+                max-height: 140px;
+                margin: 0 16px 0 0;
+                padding: 0;
+            }
+            QMessageBox::text {
+                padding-right: 8px;
+            }
+            QMessageBox::button-layout {
+                min-height: 42px;
+            }
+        """)
+        box.setDefaultButton(QPushButton("OK"))
+        box.show()
+        QTimer.singleShot(1750, box.accept)
+
+    def _submit_key(self) -> None:
+        entered_key = self.key_input.text().strip()
+        if not entered_key:
+            self._show_standard_alert("Missing key", "Please input the key before continuing.")
+            return
+        if not entered_key.startswith("sk-"):
+            self._show_standard_alert("Invalid key", "The input key is invalid, please redo.")
+            self.key_input.clear()
+            self.key_input.setFocus()
+            return
+
+        global key
+        key = entered_key
+        self.key = entered_key
+        self.setCentralWidget(self.content_widget)
+
     def _apply_styles(self) -> None:
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #f6f5f1; color: #20211f; }
@@ -338,13 +492,7 @@ class SpreadsheetWindow(QMainWindow):
 
     def _clear_window(self) -> None:
         if not self.go_button.property("hasFile"):
-            message_box = QMessageBox(self)
-            message_box.setWindowTitle("No file")
-            message_box.setText("No file is uploaded")
-            message_box.setStandardButtons(QMessageBox.StandardButton.NoButton)
-            self.no_file_message = message_box
-            message_box.show()
-            QTimer.singleShot(1500, message_box.accept)
+            self._show_standard_alert("No file", "No file is uploaded")
             return
         entries = [
             (word_item.text(), explanation_item.text())
@@ -387,7 +535,8 @@ class SpreadsheetWindow(QMainWindow):
         answer_box.setPlaceholderText("Enter the Chinese definition")
         answer_box.setObjectName("answerBox")
         answer_box.setInputMethodHints(Qt.InputMethodHint.ImhNone)
-        answer_box.setFixedSize(460, 90)
+        answer_box.setMinimumWidth(700)
+        answer_box.setFixedHeight(90)
         practice_layout.addWidget(answer_box, 0, Qt.AlignmentFlag.AlignHCenter)
         result_label = QLabel("")
         result_label.setObjectName("statusLabel")
@@ -480,8 +629,18 @@ class SpreadsheetWindow(QMainWindow):
             "border: 2px solid #3a8f62;" if correct else "border: 2px solid #c85132;"
         )
         if correct:
+            entry = self.practice_entries[self.practice_index]
+            answer_box.setText(entry[1])
+            answer_box.setReadOnly(True)
+            self.give_up_button.hide()
+            ok_button.setText("Next")
+            ok_button.setEnabled(True)
+            try:
+                ok_button.clicked.disconnect()
+            except RuntimeError:
+                pass
+            ok_button.clicked.connect(self._show_next_practice_entry)
             self.result_label.setText(reason or "Correct")
-            self._advance_after_answer(answer_box, ok_button, thread, worker)
         else:
             entry = self.practice_entries[self.practice_index]
             self.practice_error_counts[entry] += 1
@@ -506,6 +665,7 @@ class SpreadsheetWindow(QMainWindow):
                 pass
             ok_button.clicked.connect(self._show_next_practice_entry)
             self.result_label.setText(f"Incorrect twice. Correct answer: {entry[1]}")
+            answer_box.setText(entry[1])
         thread.finished.connect(lambda: self._release_judge_references(worker))
 
     def _advance_after_answer(
@@ -515,10 +675,7 @@ class SpreadsheetWindow(QMainWindow):
         thread: QThread,
         worker: AnswerJudgeWorker,
     ) -> None:
-        QTimer.singleShot(
-            900,
-            self._show_next_practice_entry,
-        )
+        pass
 
     def _show_next_practice_entry(self) -> None:
         self.practice_index += 1
@@ -548,9 +705,10 @@ class SpreadsheetWindow(QMainWindow):
         statistics = "\n".join(
             f"{html.escape(entry[0])}: {count} incorrect"
             for entry, count in self.practice_error_counts.items()
+            if entry not in self.practice_given_up_entries
         )
         given_up = "\n".join(
-            f'<span style="color: #c85132;">{html.escape(entry[0])}</span>'
+            f'<span style="color: #c85132;">{html.escape(entry[0])}</span> : unknown'
             for entry in self.practice_given_up_entries
         )
         report = f"Finished\n\n{statistics}"
