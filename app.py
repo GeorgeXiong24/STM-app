@@ -7,14 +7,87 @@ import random
 import json
 import html
 import os
+import subprocess
+import ssl
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+
+REQUIRED_PACKAGES = (
+    "PySide6>=6.7",
+    "numbers-parser>=4.19",
+    "openpyxl>=3.1",
+)
+REQUIRED_MODULES = ("PySide6", "numbers_parser", "openpyxl")
+
+
+def _ensure_runtime_environment() -> None:
+    project_directory = Path(__file__).resolve().parent
+    environment_directory = project_directory / ".venv"
+    in_virtual_environment = sys.prefix != sys.base_prefix
+    environment_python = (
+        Path(sys.executable)
+        if in_virtual_environment
+        else environment_directory / "bin" / "python"
+    )
+
+    try:
+        if not environment_python.exists():
+            subprocess.check_call(
+                [sys.executable, "-m", "venv", str(environment_directory)]
+            )
+
+        missing_modules = subprocess.run(
+            [
+                str(environment_python),
+                "-c",
+                "import " + ", ".join(REQUIRED_MODULES),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode != 0
+        if not missing_modules:
+            if in_virtual_environment:
+                return
+            os.execv(
+                str(environment_python),
+                [str(environment_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+            )
+
+        subprocess.check_call(
+            [
+                str(environment_python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                *REQUIRED_PACKAGES,
+            ]
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(
+            "STM could not prepare its Python environment. "
+            "Please check that Python 3.10+ and an internet connection are available.\n"
+            f"Details: {error}"
+        ) from error
+
+    if not in_virtual_environment:
+        os.execv(
+            str(environment_python),
+            [str(environment_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+
+
+_ensure_runtime_environment()
+
 from numbers_parser import Document
 from openpyxl import load_workbook
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+
+key = ""
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +101,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -44,8 +119,41 @@ class AnswerJudgeWorker(QObject):
         self.explanation = explanation
         self.answer = answer
 
+    @staticmethod
+    def _build_ssl_context(base_url: str) -> ssl.SSLContext:
+        verify_ssl = os.environ.get("DEEPSEEK_VERIFY_SSL", "true").lower()
+        should_verify = verify_ssl not in {"0", "false", "no", "off"}
+
+        if should_verify:
+            return ssl.create_default_context()
+
+        return ssl._create_unverified_context()
+
+    @staticmethod
+    def _is_certificate_error(error: BaseException) -> bool:
+        message = str(error).lower()
+        return (
+            "certificate verify failed" in message
+            or "self-signed certificate" in message
+            or "ssl: cert" in message
+            or "unable to get local issuer certificate" in message
+        )
+
+    def _send_judgment_request(self, request: urllib.request.Request, ssl_context: ssl.SSLContext):
+        with urllib.request.urlopen(request, timeout=30, context=ssl_context) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        content = result["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        judgment = json.loads(content)
+        correct = judgment["correct"]
+        reason = str(judgment.get("reason", ""))
+        if not isinstance(correct, bool):
+            raise ValueError("The API returned a non-boolean correctness value.")
+        return correct, reason
+
     def run(self) -> None:
-        api_key = "your_api_key_here"
+        api_key = (key or "").strip()
         if not api_key:
             self.finished.emit(False, "DEEPSEEK_API_KEY is not set.")
             return
@@ -88,17 +196,9 @@ class AnswerJudgeWorker(QObject):
             },
             method="POST",
         )
+        ssl_context = self._build_ssl_context(base_url)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            content = result["choices"][0]["message"]["content"].strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            judgment = json.loads(content)
-            correct = judgment["correct"]
-            reason = str(judgment.get("reason", ""))
-            if not isinstance(correct, bool):
-                raise ValueError("The API returned a non-boolean correctness value.")
+            correct, reason = self._send_judgment_request(request, ssl_context)
         except urllib.error.HTTPError as error:
             try:
                 details = error.read().decode("utf-8", errors="replace")
@@ -106,7 +206,26 @@ class AnswerJudgeWorker(QObject):
                 details = str(error)
             self.finished.emit(None, f"DeepSeek HTTP {error.code}: {details}")
             return
-        except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as error:
+        except urllib.error.URLError as error:
+            if self._is_certificate_error(error):
+                try:
+                    correct, reason = self._send_judgment_request(request, ssl._create_unverified_context())
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError, ssl.SSLError) as retry_error:
+                    self.finished.emit(None, f"Could not judge the answer: {retry_error}")
+                    return
+                self.finished.emit(correct, reason)
+                return
+            self.finished.emit(None, f"Could not judge the answer: {error}")
+            return
+        except (TimeoutError, KeyError, IndexError, ValueError, ssl.SSLError) as error:
+            if self._is_certificate_error(error):
+                try:
+                    correct, reason = self._send_judgment_request(request, ssl._create_unverified_context())
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError, ssl.SSLError) as retry_error:
+                    self.finished.emit(None, f"Could not judge the answer: {retry_error}")
+                    return
+                self.finished.emit(correct, reason)
+                return
             self.finished.emit(None, f"Could not judge the answer: {error}")
             return
         self.finished.emit(correct, reason)
@@ -116,22 +235,23 @@ class SpreadsheetWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.current_path: Path | None = None
-        self.temporary_directory = tempfile.TemporaryDirectory(prefix="wr-")
-        self.setWindowTitle("WR")
+        self.temporary_directory = tempfile.TemporaryDirectory(prefix="STM-")
+        self.setWindowTitle("STM")
         self.setMinimumSize(900, 760)
         self.resize(1180, 980)
+        self.key = ""
         self._build_ui()
         self._apply_styles()
+        self._show_key_entry_screen()
 
     def _build_ui(self) -> None:
         self.content_widget = QWidget()
-        self.setCentralWidget(self.content_widget)
         root = QVBoxLayout(self.content_widget)
         root.setContentsMargins(34, 28, 34, 28)
         root.setSpacing(20)
 
         header = QHBoxLayout()
-        brand = QLabel("WR")
+        brand = QLabel("STM")
         brand.setObjectName("brand")
         header.addWidget(brand)
         header.addStretch()
@@ -145,7 +265,7 @@ class SpreadsheetWindow(QMainWindow):
         intro.setSpacing(5)
         title = QLabel("Your workspace for sheets.")
         title.setObjectName("title")
-        subtitle = QLabel("Upload a Numbers or Excel file for temporary processing.")
+        subtitle = QLabel("Upload a Numbers or Excel file of your word list.")
         subtitle.setObjectName("subtitle")
         intro.addWidget(title)
         intro.addWidget(subtitle)
@@ -182,7 +302,7 @@ class SpreadsheetWindow(QMainWindow):
         root.addWidget(self.words_label)
         self.words_table = QTableWidget(0, 3)
         self.words_table.setObjectName("wordsTable")
-        self.words_table.setHorizontalHeaderLabels(["单词", "解释", ""])
+        self.words_table.setHorizontalHeaderLabels(["Words", "Definitions", ""])
         self.words_table.setAlternatingRowColors(True)
         self.words_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.words_table.horizontalHeader().setStretchLastSection(False)
@@ -191,15 +311,19 @@ class SpreadsheetWindow(QMainWindow):
         self.words_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.words_table, 1)
 
-        self.storage_label = QLabel("Uploaded files are removed when you close WR.")
+        self.storage_label = QLabel("Uploaded files are removed when you close STM.")
         self.storage_label.setObjectName("storageLabel")
         root.addWidget(self.storage_label)
 
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("Waiting for a file to be uploaded...")
         self.status_label.setObjectName("statusLabel")
         root.addWidget(self.status_label)
 
         bottom_actions = QHBoxLayout()
+        self.back_button = QPushButton("Back")
+        self.back_button.setObjectName("goButton")
+        self.back_button.clicked.connect(self._return_to_key_entry)
+        bottom_actions.addWidget(self.back_button)
         bottom_actions.addStretch()
         self.go_button = QPushButton("Go")
         self.go_button.setObjectName("goButton")
@@ -213,6 +337,138 @@ class SpreadsheetWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.choose_file)
         file_menu.addAction(open_action)
+
+    def _show_key_entry_screen(self) -> None:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(180, 220, 180, 200)
+        layout.setSpacing(18)
+
+        title = QLabel("Hi! This is STM by George Xiong.")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        row = QHBoxLayout()
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Please input the key")
+        self.key_input.setObjectName("answerBox")
+        self.key_input.setMinimumWidth(620)
+        self.key_input.setFixedHeight(60)
+        self.key_input.returnPressed.connect(self._submit_key)
+        row.addWidget(self.key_input)
+
+        self.key_button = QPushButton("OK")
+        self.key_button.setObjectName("primaryButton")
+        self.key_button.clicked.connect(self._submit_key)
+        row.addWidget(self.key_button)
+        layout.addLayout(row)
+
+        self.key_entry_widget = widget
+        self._set_central_widget(widget)
+        self.key_input.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _set_central_widget(self, widget: QWidget) -> None:
+        current_widget = self.takeCentralWidget()
+        if current_widget is not None and current_widget is not widget:
+            current_widget.setParent(None)
+        self.setCentralWidget(widget)
+
+    def _show_standard_alert(self, title: str, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(message)
+        warning_icon = box.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        warning_pixmap = warning_icon.pixmap(140, 140).scaled(
+            140,
+            140,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        box.setIconPixmap(warning_pixmap)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setStyleSheet("""
+            QMessageBox {
+                background: #f6f5f1;
+                border: 1px solid #e1ddd4;
+                border-radius: 12px;
+                min-width: 420px;
+            }
+            QMessageBox QLabel {
+                color: #20211f;
+                font: 500 15px 'Avenir Next';
+                margin: 0px;
+            }
+            QMessageBox QPushButton {
+                background: #c85132;
+                color: white;
+                border: 0;
+                border-radius: 6px;
+                padding: 10px 22px;
+                min-width: 90px;
+                font: 600 13px 'Avenir Next';
+            }
+            QMessageBox QPushButton:hover {
+                background: #ad4127;
+            }
+            QMessageBox > QPushButton {
+                margin-top: 12px;
+            }
+            QMessageBox::icon {
+                width: 140px;
+                min-width: 140px;
+                max-width: 140px;
+                height: 140px;
+                min-height: 140px;
+                max-height: 140px;
+                margin: 0 16px 0 0;
+                padding: 0;
+            }
+            QMessageBox::text {
+                padding-right: 8px;
+            }
+            QMessageBox::button-layout {
+                min-height: 42px;
+            }
+        """)
+        box.setDefaultButton(QPushButton("OK"))
+        box.show()
+        QTimer.singleShot(1750, box.accept)
+
+    def _submit_key(self) -> None:
+        entered_key = self.key_input.text().strip()
+        if not entered_key:
+            self._show_standard_alert("Missing key", "Please input the key before continuing.")
+            return
+        if not entered_key.startswith("sk-"):
+            self._show_standard_alert("Invalid key", "The input key is invalid, please redo.")
+            self.key_input.clear()
+            self.key_input.setFocus()
+            return
+
+        global key
+        key = entered_key
+        self.key = entered_key
+        self._set_central_widget(self.content_widget)
+
+    def _return_to_key_entry(self) -> None:
+        previous_key = self.key or key
+        if self.current_path is not None:
+            try:
+                self.current_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.current_path = None
+        self.words_table.setRowCount(0)
+        self.words_label.setText("Words")
+        self.file_label.setText("No file uploaded")
+        self.storage_label.setText("Uploaded files are removed when you close STM.")
+        self.status_label.setText("Waiting for a file to be uploaded...")
+        self._set_go_file_state(False)
+        self._show_key_entry_screen()
+        self.key_input.setText(previous_key)
+        self.key_input.selectAll()
+        self.key_input.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _apply_styles(self) -> None:
         self.setStyleSheet("""
@@ -234,6 +490,8 @@ class SpreadsheetWindow(QMainWindow):
             #uploadMark { color: #c85132; font: 700 30px 'Avenir Next'; }
             #dropTitle { color: #353633; font: 600 16px 'Avenir Next'; }
             #dropHint, #statusLabel, #storageLabel { color: #85877f; font: 13px 'Avenir Next'; }
+            #progressLabel { color: #85877f; font: 600 14px 'Avenir Next'; }
+            #reportHint { color: #85877f; font: 12px 'Avenir Next'; padding-top: 4px; }
             #fileLabel { color: #3f413d; font: 600 14px 'Avenir Next'; padding: 2px 0; }
             #wordsLabel { color: #353633; font: 600 16px 'Avenir Next'; padding-top: 4px; }
             #wordsTable { border: 1px solid #e1ddd4; border-radius: 6px; background: #fffdf9; font: 14px 'Avenir Next'; }
@@ -256,14 +514,57 @@ class SpreadsheetWindow(QMainWindow):
             self.open_file(Path(urls[0].toLocalFile()))
             event.acceptProposedAction()
 
+    def _show_analysis_popup(self) -> None:
+        self.analysis_popup = QProgressDialog(
+            "Uploading and analyzing the file...", None, 0, 0, self
+        )
+        self.analysis_popup.setWindowTitle("Please wait")
+        self.analysis_popup.setWindowModality(Qt.WindowModality.WindowModal)
+        self.analysis_popup.setAutoClose(False)
+        self.analysis_popup.setMinimumWidth(360)
+        self.analysis_popup.setStyleSheet("""
+            QProgressDialog {
+                background: #f6f5f1;
+                border: 1px solid #e1ddd4;
+                border-radius: 12px;
+            }
+            QProgressDialog QLabel {
+                color: #20211f;
+                font: 500 15px 'Avenir Next';
+                padding: 12px 18px;
+            }
+            QProgressBar {
+                min-height: 8px;
+                max-height: 8px;
+                border: 0;
+                border-radius: 4px;
+                background: #e1ddd4;
+            }
+            QProgressBar::chunk {
+                border-radius: 4px;
+                background: #c85132;
+            }
+        """)
+        self.analysis_popup.show()
+        QApplication.processEvents()
+
+    def _close_analysis_popup(self) -> None:
+        popup = getattr(self, "analysis_popup", None)
+        if popup is not None:
+            popup.close()
+            popup.deleteLater()
+            self.analysis_popup = None
+
     def open_file(self, path: Path) -> None:
         if path.suffix.lower() not in {".numbers", ".xlsx"}:
-            self._show_error("WR accepts .numbers and .xlsx files only.")
+            self._show_error("STM accepts .numbers and .xlsx files only.")
             return
+        self._show_analysis_popup()
         try:
             temporary_path = Path(self.temporary_directory.name) / path.name
             shutil.copy2(path, temporary_path)
         except Exception as error:
+            self._close_analysis_popup()
             self._show_error(f"Could not upload this file.\n\n{error}")
             return
         self.current_path = temporary_path
@@ -275,9 +576,11 @@ class SpreadsheetWindow(QMainWindow):
             self.words_table.setRowCount(0)
             self.words_label.setText("Words")
             self._set_go_file_state(False)
+            self._close_analysis_popup()
             self._show_error(f"Could not read the 单词 column.\n\n{error}")
             return
 
+        self._close_analysis_popup()
         self.words_table.setRowCount(0)
         for word, explanation in entries:
             row = self.words_table.rowCount()
@@ -289,17 +592,11 @@ class SpreadsheetWindow(QMainWindow):
             self.words_table.setCellWidget(row, 2, delete_button)
         self.words_label.setText(f"Words ({len(entries)})")
         self._set_go_file_state(True)
-        self.status_label.setText("Upload ready")
+        self.status_label.setText("Ready to start testing")
 
     def _clear_window(self) -> None:
         if not self.go_button.property("hasFile"):
-            message_box = QMessageBox(self)
-            message_box.setWindowTitle("No file")
-            message_box.setText("No file is uploaded")
-            message_box.setStandardButtons(QMessageBox.StandardButton.NoButton)
-            self.no_file_message = message_box
-            message_box.show()
-            QTimer.singleShot(1500, message_box.accept)
+            self._show_standard_alert("No file", "No file is uploaded")
             return
         entries = [
             (word_item.text(), explanation_item.text())
@@ -328,6 +625,13 @@ class SpreadsheetWindow(QMainWindow):
         practice_layout.setContentsMargins(34, 28, 34, 28)
         practice_layout.setSpacing(20)
 
+        progress_label = QLabel(
+            f"{self.practice_index + 1}/{len(self.practice_entries)}"
+        )
+        progress_label.setObjectName("progressLabel")
+        progress_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        practice_layout.addWidget(progress_label)
+
         word_label = QLabel("Word")
         word_label.setObjectName("wordsLabel")
         word_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -342,13 +646,18 @@ class SpreadsheetWindow(QMainWindow):
         answer_box.setPlaceholderText("Enter the Chinese definition")
         answer_box.setObjectName("answerBox")
         answer_box.setInputMethodHints(Qt.InputMethodHint.ImhNone)
-        answer_box.setFixedSize(460, 90)
+        answer_box.setMinimumWidth(700)
+        answer_box.setFixedHeight(90)
         practice_layout.addWidget(answer_box, 0, Qt.AlignmentFlag.AlignHCenter)
         result_label = QLabel("")
         result_label.setObjectName("statusLabel")
         result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         result_label.setWordWrap(True)
         practice_layout.addWidget(result_label)
+        report_hint = QLabel("")
+        report_hint.setObjectName("reportHint")
+        report_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        practice_layout.addWidget(report_hint)
         practice_layout.addStretch(1)
 
         action_row = QHBoxLayout()
@@ -366,14 +675,16 @@ class SpreadsheetWindow(QMainWindow):
         action_row.addWidget(ok_button)
         practice_layout.addLayout(action_row)
 
-        self.setCentralWidget(practice_widget)
+        self._set_central_widget(practice_widget)
         self.practice_widget = practice_widget
+        self.practice_progress_label = progress_label
         self.practice_word_label = word_label
         self.practice_word_display = word_display
         self.answer_box = answer_box
         self.ok_button = ok_button
         self.give_up_button = give_up_button
         self.result_label = result_label
+        self.report_hint = report_hint
         answer_box.setFocus(Qt.FocusReason.OtherFocusReason)
         answer_box.activateWindow()
 
@@ -435,8 +746,26 @@ class SpreadsheetWindow(QMainWindow):
             "border: 2px solid #3a8f62;" if correct else "border: 2px solid #c85132;"
         )
         if correct:
+            entry = self.practice_entries[self.practice_index]
+            answer_box.setText(entry[1])
+            answer_box.setReadOnly(True)
+            self.give_up_button.hide()
+            ok_button.setText("Next")
+            ok_button.setEnabled(True)
+            ok_button.setDefault(True)
+            try:
+                ok_button.clicked.disconnect()
+            except RuntimeError:
+                pass
+            try:
+                answer_box.returnPressed.disconnect(ok_button.click)
+            except (RuntimeError, TypeError):
+                pass
+            ok_button.clicked.connect(
+                lambda: QTimer.singleShot(0, self._show_next_practice_entry)
+            )
+            ok_button.setFocus(Qt.FocusReason.OtherFocusReason)
             self.result_label.setText(reason or "Correct")
-            self._advance_after_answer(answer_box, ok_button, thread, worker)
         else:
             entry = self.practice_entries[self.practice_index]
             self.practice_error_counts[entry] += 1
@@ -455,12 +784,21 @@ class SpreadsheetWindow(QMainWindow):
             answer_box.setReadOnly(True)
             ok_button.setText("Next")
             ok_button.setEnabled(True)
+            ok_button.setDefault(True)
             try:
                 ok_button.clicked.disconnect()
             except RuntimeError:
                 pass
-            ok_button.clicked.connect(self._show_next_practice_entry)
+            try:
+                answer_box.returnPressed.disconnect(ok_button.click)
+            except (RuntimeError, TypeError):
+                pass
+            ok_button.clicked.connect(
+                lambda: QTimer.singleShot(0, self._show_next_practice_entry)
+            )
+            ok_button.setFocus(Qt.FocusReason.OtherFocusReason)
             self.result_label.setText(f"Incorrect twice. Correct answer: {entry[1]}")
+            answer_box.setText(entry[1])
         thread.finished.connect(lambda: self._release_judge_references(worker))
 
     def _advance_after_answer(
@@ -470,10 +808,7 @@ class SpreadsheetWindow(QMainWindow):
         thread: QThread,
         worker: AnswerJudgeWorker,
     ) -> None:
-        QTimer.singleShot(
-            900,
-            self._show_next_practice_entry,
-        )
+        pass
 
     def _show_next_practice_entry(self) -> None:
         self.practice_index += 1
@@ -503,19 +838,23 @@ class SpreadsheetWindow(QMainWindow):
         statistics = "\n".join(
             f"{html.escape(entry[0])}: {count} incorrect"
             for entry, count in self.practice_error_counts.items()
+            if entry not in self.practice_given_up_entries
         )
         given_up = "\n".join(
-            f'<span style="color: #c85132;">{html.escape(entry[0])}</span>'
+            f'<span style="color: #c85132;">{html.escape(entry[0])}</span> : unknown'
             for entry in self.practice_given_up_entries
         )
         report = f"Finished\n\n{statistics}"
         if given_up:
             report += f"\n\nGiven up\n{given_up}"
+        self.practice_progress_label.hide()
         self.practice_word_label.hide()
         self.practice_word_display.hide()
         self.answer_box.hide()
         self.ok_button.setText("Finish")
         self.ok_button.setEnabled(True)
+        self.ok_button.setDefault(True)
+        self.ok_button.setFocus(Qt.FocusReason.OtherFocusReason)
         try:
             self.ok_button.clicked.disconnect()
         except RuntimeError:
@@ -524,6 +863,7 @@ class SpreadsheetWindow(QMainWindow):
         self.result_label.setStyleSheet("font-size: 20px; font-weight: 600;")
         self.result_label.setTextFormat(Qt.TextFormat.RichText)
         self.result_label.setText(report.replace("\n", "<br>"))
+        self.report_hint.setText("Press Enter or click Finish to start a new test")
 
     def _return_to_start(self) -> None:
         if self.current_path is not None:
@@ -535,10 +875,10 @@ class SpreadsheetWindow(QMainWindow):
         self.words_table.setRowCount(0)
         self.words_label.setText("Words")
         self.file_label.setText("No file uploaded")
-        self.storage_label.setText("Uploaded files are removed when you close WR.")
-        self.status_label.setText("Ready")
+        self.storage_label.setText("Uploaded files are removed when you close STM.")
+        self.status_label.setText("Waiting for a file to be uploaded...")
         self._set_go_file_state(False)
-        self.setCentralWidget(self.content_widget)
+        self._set_central_widget(self.content_widget)
         self.menuBar().show()
 
     def _release_judge_references(self, worker: AnswerJudgeWorker) -> None:
@@ -573,50 +913,115 @@ class SpreadsheetWindow(QMainWindow):
             finally:
                 workbook.close()
 
-            return self._words_from_groups(row_groups)
+        else:
+            document = Document(str(path))
+            row_groups = [
+                list(table.rows(values_only=True))
+                for sheet in document.sheets
+                for table in sheet.tables
+            ]
 
-        document = Document(str(path))
-        row_groups = [
-            table.rows(values_only=True)
-            for sheet in document.sheets
-            for table in sheet.tables
+        rows = [
+            [value for value in row]
+            for group in row_groups
+            for row in group
+            if any(value not in (None, "") for value in row)
         ]
-        return self._words_from_groups(row_groups)
+        if not rows:
+            raise ValueError("The uploaded file does not contain any data.")
 
-    @classmethod
-    def _words_from_groups(cls, row_groups: Any) -> list[tuple[str, str]]:
-        entries: list[tuple[str, str]] = []
-        found_column = False
-        for rows in row_groups:
-            try:
-                entries.extend(cls._words_from_rows(rows))
-                found_column = True
-            except ValueError:
-                continue
-        if not found_column:
-            raise ValueError('Columns named "单词" and "解释" were not found.')
+        return self._recognize_words_with_ai(rows)
+
+    def _recognize_words_with_ai(self, rows: list[list[Any]]) -> list[tuple[str, str]]:
+        api_key = (key or "").strip()
+        if not api_key:
+            raise ValueError("Please provide a DeepSeek API key first.")
+
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract English vocabulary words and their Chinese definitions from "
+                        "the supplied spreadsheet rows. Do not rely on column names or their "
+                        "language. Identify the two fields by their actual content. Ignore "
+                        "titles, notes, numbering, empty rows, and unrelated columns. Return "
+                        "JSON only in the form {\"entries\":[{\"word\":\"...\","
+                        "\"definition\":\"...\"}]}. Keep the original text."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"rows": rows}, ensure_ascii=False, default=str),
+                },
+            ],
+        }
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            result = self._request_json(request, base_url)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ssl.SSLError) as error:
+            raise ValueError(f"Could not recognize words with DeepSeek: {error}") from error
+
+        try:
+            content = result["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            recognized = json.loads(content)["entries"]
+            entries = [
+                (str(entry["word"]).strip(), str(entry["definition"]).strip())
+                for entry in recognized
+                if isinstance(entry, dict)
+                and str(entry.get("word", "")).strip()
+                and str(entry.get("definition", "")).strip()
+            ]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError("DeepSeek returned an invalid word recognition result.") from error
+
+        if not entries:
+            raise ValueError("DeepSeek could not find English words and Chinese definitions.")
         return entries
 
-    @staticmethod
-    def _words_from_rows(rows: Any) -> list[tuple[str, str]]:
-        rows = iter(rows)
-        word_index: int | None = None
-        explanation_index: int | None = None
-        entries: list[tuple[str, str]] = []
-        for row in rows:
-            values = list(row)
-            if word_index is None or explanation_index is None:
-                if "单词" not in values or "解释" not in values:
-                    continue
-                word_index = values.index("单词")
-                explanation_index = values.index("解释")
-                continue
-            if word_index < len(values) and values[word_index] not in (None, ""):
-                explanation = values[explanation_index] if explanation_index < len(values) else ""
-                entries.append((str(values[word_index]), str(explanation or "")))
-        if word_index is None or explanation_index is None:
-            raise ValueError('Columns named "单词" and "解释" were not found.')
-        return entries
+    def _request_json(self, request: urllib.request.Request, base_url: str) -> Any:
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+                context=AnswerJudgeWorker._build_ssl_context(base_url),
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as error:
+            if AnswerJudgeWorker._is_certificate_error(error):
+                with urllib.request.urlopen(
+                    request,
+                    timeout=30,
+                    context=ssl._create_unverified_context(),
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            raise
+
+    def keyPressEvent(self, event: Any) -> None:
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self.centralWidget() is self.content_widget
+        ):
+            self._return_to_key_entry()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: Any) -> None:
         self.temporary_directory.cleanup()
@@ -629,7 +1034,7 @@ class SpreadsheetWindow(QMainWindow):
 
 def main() -> None:
     application = QApplication(sys.argv)
-    application.setApplicationName("WR")
+    application.setApplicationName("STM")
     window = SpreadsheetWindow()
     window.show()
     sys.exit(application.exec())
