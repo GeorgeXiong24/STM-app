@@ -20,21 +20,43 @@ REQUIRED_PACKAGES = (
     "numbers-parser>=4.19",
     "openpyxl>=3.1",
 )
+REQUIRED_MODULES = ("PySide6", "numbers_parser", "openpyxl")
 
 
 def _ensure_runtime_environment() -> None:
-    if sys.prefix != sys.base_prefix:
-        return
-
     project_directory = Path(__file__).resolve().parent
     environment_directory = project_directory / ".venv"
-    environment_python = environment_directory / "bin" / "python"
+    in_virtual_environment = sys.prefix != sys.base_prefix
+    environment_python = (
+        Path(sys.executable)
+        if in_virtual_environment
+        else environment_directory / "bin" / "python"
+    )
 
     try:
         if not environment_python.exists():
             subprocess.check_call(
                 [sys.executable, "-m", "venv", str(environment_directory)]
             )
+
+        missing_modules = subprocess.run(
+            [
+                str(environment_python),
+                "-c",
+                "import " + ", ".join(REQUIRED_MODULES),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode != 0
+        if not missing_modules:
+            if in_virtual_environment:
+                return
+            os.execv(
+                str(environment_python),
+                [str(environment_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+            )
+
         subprocess.check_call(
             [
                 str(environment_python),
@@ -52,7 +74,11 @@ def _ensure_runtime_environment() -> None:
             f"Details: {error}"
         ) from error
 
-    os.execv(str(environment_python), [str(environment_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+    if not in_virtual_environment:
+        os.execv(
+            str(environment_python),
+            [str(environment_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
 
 
 _ensure_runtime_environment()
