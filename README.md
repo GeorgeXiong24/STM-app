@@ -1,6 +1,7 @@
 # Smart-Testing-of-Memorization-App
 
 English version: https://github.com/GeorgeXiong24/STM-app/blob/main/README.md
+
 Chinese version: https://github.com/GeorgeXiong24/STM-app/blob/main/README_cn.md
 
 For most English-Chinese word reciting or remembering app in the market currently, the word dictionary or word list is usually being limited or already being set up including a specific range. 
