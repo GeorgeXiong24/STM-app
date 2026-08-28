@@ -10,4 +10,4 @@ After a full testing, a report will be generated, demonstrating the number of ti
 
 Finally, you have two options to use this app. One is to buy the DeepSeek API yourself, and enter the API into the input box at the start of the app interface. This allows the app to directly provoke the AI to function normally. The other option is currently under development, if it is finished, we will update the .md file to inform you about the improvement. Other functions are also under development, please wait for more functions to come out. If there are any issues or bugs, you are welcome to submit them in https://github.com/GeorgeXiong24/STM-app/issues.
 
-Thank you so much for using and supporting our app.
+For downloading our app, please visit https://github.com/GeorgeXiong24/STM-app/releases. Thank you so much for using and supporting our app.
