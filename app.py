@@ -24,6 +24,9 @@ REQUIRED_MODULES = ("PySide6", "numbers_parser", "openpyxl")
 
 
 def _ensure_runtime_environment() -> None:
+    if getattr(sys, "frozen", False):
+        return
+
     project_directory = Path(__file__).resolve().parent
     environment_directory = project_directory / ".venv"
     in_virtual_environment = sys.prefix != sys.base_prefix
@@ -84,13 +87,15 @@ def _ensure_runtime_environment() -> None:
 _ensure_runtime_environment()
 
 from numbers_parser import Document
-from openpyxl import load_workbook
+from numbers_parser import Document as NumbersDocument
+from openpyxl import Workbook, load_workbook
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 
 key = ""
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -102,7 +107,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressDialog,
-    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -378,14 +382,7 @@ class SpreadsheetWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle(title)
         box.setText(message)
-        warning_icon = box.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
-        warning_pixmap = warning_icon.pixmap(140, 140).scaled(
-            140,
-            140,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        box.setIconPixmap(warning_pixmap)
+        box.setIcon(QMessageBox.Icon.NoIcon)
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
         box.setStyleSheet("""
             QMessageBox {
@@ -414,18 +411,8 @@ class SpreadsheetWindow(QMainWindow):
             QMessageBox > QPushButton {
                 margin-top: 12px;
             }
-            QMessageBox::icon {
-                width: 140px;
-                min-width: 140px;
-                max-width: 140px;
-                height: 140px;
-                min-height: 140px;
-                max-height: 140px;
-                margin: 0 16px 0 0;
-                padding: 0;
-            }
             QMessageBox::text {
-                padding-right: 8px;
+                padding-right: 0;
             }
             QMessageBox::button-layout {
                 min-height: 42px;
@@ -516,8 +503,11 @@ class SpreadsheetWindow(QMainWindow):
 
     def _show_analysis_popup(self) -> None:
         self.analysis_popup = QProgressDialog(
-            "Uploading and analyzing the file...", None, 0, 0, self
+            "Uploading and analyzing the file...", "", 0, 0, self
         )
+        cancel_button = self.analysis_popup.findChild(QPushButton)
+        if cancel_button is not None:
+            cancel_button.hide()
         self.analysis_popup.setWindowTitle("Please wait")
         self.analysis_popup.setWindowModality(Qt.WindowModality.WindowModal)
         self.analysis_popup.setAutoClose(False)
@@ -596,7 +586,7 @@ class SpreadsheetWindow(QMainWindow):
 
     def _clear_window(self) -> None:
         if not self.go_button.property("hasFile"):
-            self._show_standard_alert("No file", "No file is uploaded")
+            self._show_standard_alert("No file", "No file is uploaded.")
             return
         entries = [
             (word_item.text(), explanation_item.text())
@@ -605,6 +595,7 @@ class SpreadsheetWindow(QMainWindow):
             and (explanation_item := self.words_table.item(row, 1)) is not None
         ]
         if not entries:
+            self._show_standard_alert("No words", "There are no words.")
             return
 
         random.shuffle(entries)
@@ -685,6 +676,7 @@ class SpreadsheetWindow(QMainWindow):
         self.give_up_button = give_up_button
         self.result_label = result_label
         self.report_hint = report_hint
+        self.practice_layout = practice_layout
         answer_box.setFocus(Qt.FocusReason.OtherFocusReason)
         answer_box.activateWindow()
 
@@ -835,6 +827,17 @@ class SpreadsheetWindow(QMainWindow):
         self._show_statistics()
 
     def _show_statistics(self) -> None:
+        export_entries = sorted(
+            (
+                entry[0],
+                entry[1],
+                "Given up"
+                if entry in self.practice_given_up_entries
+                else f"{self.practice_error_counts[entry]} incorrect",
+            )
+            for entry, count in self.practice_error_counts.items()
+            if count > 0 or entry in self.practice_given_up_entries
+        )
         statistics = "\n".join(
             f"{html.escape(entry[0])}: {count} incorrect"
             for entry, count in self.practice_error_counts.items()
@@ -851,6 +854,7 @@ class SpreadsheetWindow(QMainWindow):
         self.practice_word_label.hide()
         self.practice_word_display.hide()
         self.answer_box.hide()
+        self.give_up_button.hide()
         self.ok_button.setText("Finish")
         self.ok_button.setEnabled(True)
         self.ok_button.setDefault(True)
@@ -864,6 +868,88 @@ class SpreadsheetWindow(QMainWindow):
         self.result_label.setTextFormat(Qt.TextFormat.RichText)
         self.result_label.setText(report.replace("\n", "<br>"))
         self.report_hint.setText("Press Enter or click Finish to start a new test")
+
+        self.export_count_checkbox = QCheckBox("Include incorrect count in export")
+        self.export_count_checkbox.setChecked(True)
+        self.export_count_checkbox.setStyleSheet("font: 14px 'Avenir Next';")
+        self.export_xlsx_button = QPushButton("Export .xlsx")
+        self.export_xlsx_button.setObjectName("goButton")
+        self.export_xlsx_button.clicked.connect(
+            lambda: self._export_entries(export_entries, ".xlsx")
+        )
+        self.export_numbers_button = QPushButton("Export .numbers")
+        self.export_numbers_button.setObjectName("goButton")
+        self.export_numbers_button.clicked.connect(
+            lambda: self._export_entries(export_entries, ".numbers")
+        )
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(self.export_count_checkbox)
+        export_layout.addStretch()
+        export_layout.addWidget(self.export_xlsx_button)
+        export_layout.addWidget(self.export_numbers_button)
+        self.practice_layout.insertLayout(self.practice_layout.count() - 1, export_layout)
+
+    def _export_entries(
+        self, entries: list[tuple[str, str, str]], extension: str
+    ) -> None:
+        if not entries:
+            self._show_standard_alert("Nothing to export", "No incorrect or given-up words.")
+            return
+
+        include_count = self.export_count_checkbox.isChecked()
+        headers = ["Words", "Chinese definitions"]
+        if include_count:
+            headers.append("Result")
+        default_name = f"STM-review{extension}"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export review",
+            str(Path.home() / default_name),
+            f"{extension[1:].upper()} files (*{extension})",
+        )
+        if not output_path:
+            return
+        output_path = str(Path(output_path).with_suffix(extension))
+        rows = [
+            [word, definition, result] if include_count else [word, definition]
+            for word, definition, result in entries
+        ]
+        try:
+            if extension == ".xlsx":
+                workbook = Workbook()
+                worksheet = workbook.active
+                if worksheet is None:
+                    raise RuntimeError("Could not create an Excel worksheet.")
+                worksheet.title = "Review"
+                worksheet.append(headers)
+                for row in rows:
+                    worksheet.append(row)
+                worksheet.freeze_panes = "A2"
+                worksheet.auto_filter.ref = worksheet.dimensions
+                worksheet.column_dimensions["A"].width = 28
+                worksheet.column_dimensions["B"].width = 48
+                if include_count:
+                    worksheet.column_dimensions["C"].width = 18
+                workbook.save(output_path)
+            else:
+                document = NumbersDocument(
+                    None,
+                    sheet_name="Review",
+                    table_name="Review",
+                    num_header_rows=1,
+                    num_header_cols=0,
+                    num_rows=max(len(rows), 1),
+                    num_cols=len(headers),
+                )
+                table = document.default_table
+                for row_index, row in enumerate([headers, *rows]):
+                    for column_index, value in enumerate(row):
+                        table.write(row_index, column_index, value)
+                document.save(output_path)
+        except Exception as error:
+            self._show_standard_alert("Export failed", str(error))
+            return
+        self._show_standard_alert("Export complete", f"Saved to {output_path}")
 
     def _return_to_start(self) -> None:
         if self.current_path is not None:
@@ -1029,7 +1115,12 @@ class SpreadsheetWindow(QMainWindow):
 
     def _show_error(self, message: str) -> None:
         self.status_label.setText("Could not open file")
-        QMessageBox.critical(self, "Unable to open sheet", message)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.NoIcon)
+        box.setWindowTitle("Unable to open sheet")
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
 
 def main() -> None:
