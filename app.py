@@ -6,6 +6,7 @@ import tempfile
 import random
 import json
 import html
+import re
 import os
 import subprocess
 import ssl
@@ -98,6 +99,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QHeaderView,
@@ -235,6 +237,105 @@ class AnswerJudgeWorker(QObject):
         self.finished.emit(correct, reason)
 
 
+class SentenceWorker(QObject):
+    finished = Signal(str, str)
+
+    def __init__(self, word: str, explanation: str, refresh: bool = False) -> None:
+        super().__init__()
+        self.word = word
+        self.explanation = explanation
+        self.refresh = refresh
+
+    def run(self) -> None:
+        api_key = (key or "").strip()
+        if not api_key:
+            self.finished.emit("", "DEEPSEEK_API_KEY is not set.")
+            return
+
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        instruction = (
+            "Create one natural, concise English example sentence using the given word and "
+            "matching its Chinese meaning. You may change the word's tense, number, or form "
+            "when natural. Wrap the complete word form used in the sentence in double brackets "
+            "like [[word]]. Return only the sentence."
+        )
+        if self.refresh:
+            instruction = (
+                "Create a new and different natural English example sentence using the given "
+                "word and matching its Chinese meaning. You may change the word's tense, "
+                "number, or form when natural. Use a different context and wording from any "
+                "previous example. Wrap the complete word form used in the sentence in double "
+                "brackets like [[word]]. Return only the sentence."
+            )
+        payload = {
+            "model": model,
+            "temperature": 0.8 if self.refresh else 0.3,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": instruction,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"word": self.word, "chinese_meaning": self.explanation},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+                context=AnswerJudgeWorker._build_ssl_context(base_url),
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            sentence = result["choices"][0]["message"]["content"].strip()
+            if sentence.startswith("```"):
+                sentence = sentence.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            if not sentence:
+                raise ValueError("DeepSeek returned an empty sentence.")
+        except urllib.error.HTTPError as error:
+            try:
+                details = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                details = str(error)
+            self.finished.emit("", f"DeepSeek HTTP {error.code}: {details}")
+            return
+        except urllib.error.URLError as error:
+            if AnswerJudgeWorker._is_certificate_error(error):
+                try:
+                    with urllib.request.urlopen(
+                        request,
+                        timeout=30,
+                        context=ssl._create_unverified_context(),
+                    ) as response:
+                        result = json.loads(response.read().decode("utf-8"))
+                    sentence = result["choices"][0]["message"]["content"].strip()
+                except (urllib.error.HTTPError, urllib.error.URLError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as retry_error:
+                    self.finished.emit("", f"Could not generate a sentence: {retry_error}")
+                    return
+                self.finished.emit(sentence, "")
+                return
+            self.finished.emit("", f"Could not generate a sentence: {error}")
+            return
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, ssl.SSLError) as error:
+            self.finished.emit("", f"Could not generate a sentence: {error}")
+            return
+        self.finished.emit(sentence, "")
+
+
 class SpreadsheetWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -242,7 +343,10 @@ class SpreadsheetWindow(QMainWindow):
         self.temporary_directory = tempfile.TemporaryDirectory(prefix="STM-")
         self.setWindowTitle("STM")
         self.setMinimumSize(900, 760)
-        self.resize(1180, 980)
+        available_geometry = QApplication.primaryScreen().availableGeometry()
+        initial_width = max(900, int(available_geometry.width() * 0.8))
+        initial_height = min(980, int(available_geometry.height() * 0.8))
+        self.resize(initial_width, max(760, initial_height))
         self.key = ""
         self._build_ui()
         self._apply_styles()
@@ -603,6 +707,7 @@ class SpreadsheetWindow(QMainWindow):
         self.practice_incorrect_entries: list[tuple[str, str]] = []
         self.practice_given_up_entries: list[tuple[str, str]] = []
         self.practice_error_counts = {entry: 0 for entry in entries}
+        self.practice_sentence_hints: dict[tuple[str, str], str] = {}
         self.practice_index = 0
         self.practice_attempts = 0
         self.practice_reviewing = False
@@ -632,6 +737,12 @@ class SpreadsheetWindow(QMainWindow):
         word_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         word_display.setFixedSize(560, 150)
         practice_layout.addWidget(word_display, 0, Qt.AlignmentFlag.AlignHCenter)
+        sentence_label = QLabel("")
+        sentence_label.setObjectName("sentenceLabel")
+        sentence_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sentence_label.setWordWrap(True)
+        sentence_label.setTextFormat(Qt.TextFormat.RichText)
+        practice_layout.addWidget(sentence_label)
 
         answer_box = QLineEdit()
         answer_box.setPlaceholderText("Enter the Chinese definition")
@@ -651,19 +762,27 @@ class SpreadsheetWindow(QMainWindow):
         practice_layout.addWidget(report_hint)
         practice_layout.addStretch(1)
 
-        action_row = QHBoxLayout()
+        action_row = QGridLayout()
         give_up_button = QPushButton("Give up")
         give_up_button.setObjectName("goButton")
         give_up_button.clicked.connect(self._give_up_current_word)
-        action_row.addWidget(give_up_button)
-        action_row.addStretch()
+        action_row.addWidget(give_up_button, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        sentence_button = QPushButton("Sentence hint")
+        sentence_button.setObjectName("goButton")
+        sentence_button.clicked.connect(
+            lambda: self._generate_sentence(word, explanation, sentence_button)
+        )
+        action_row.addWidget(sentence_button, 0, 1, Qt.AlignmentFlag.AlignCenter)
         ok_button = QPushButton("OK")
         ok_button.setObjectName("goButton")
         ok_button.clicked.connect(
             lambda: self._submit_answer(word, explanation, answer_box, ok_button)
         )
         answer_box.returnPressed.connect(ok_button.click)
-        action_row.addWidget(ok_button)
+        action_row.addWidget(ok_button, 0, 2, Qt.AlignmentFlag.AlignRight)
+        action_row.setColumnStretch(0, 1)
+        action_row.setColumnStretch(1, 1)
+        action_row.setColumnStretch(2, 1)
         practice_layout.addLayout(action_row)
 
         self._set_central_widget(practice_widget)
@@ -671,9 +790,11 @@ class SpreadsheetWindow(QMainWindow):
         self.practice_progress_label = progress_label
         self.practice_word_label = word_label
         self.practice_word_display = word_display
+        self.sentence_label = sentence_label
         self.answer_box = answer_box
         self.ok_button = ok_button
         self.give_up_button = give_up_button
+        self.sentence_button = sentence_button
         self.result_label = result_label
         self.report_hint = report_hint
         self.practice_layout = practice_layout
@@ -687,6 +808,8 @@ class SpreadsheetWindow(QMainWindow):
         if not answer:
             self.result_label.setText("Enter an answer first")
             return
+        self.give_up_button.hide()
+        self.sentence_button.hide()
         self.practice_attempts += 1
         answer_box.setReadOnly(True)
         ok_button.setText("Judging...")
@@ -704,6 +827,70 @@ class SpreadsheetWindow(QMainWindow):
         self.answer_judge_worker = worker
         self.answer_judge_context = (answer_box, ok_button, thread, worker)
         thread.start()
+
+    def _generate_sentence(
+        self, word: str, explanation: str, sentence_button: QPushButton
+    ) -> None:
+        refresh = sentence_button.text() == "Refresh sentence"
+        sentence_button.setText("Generating...")
+        sentence_button.setEnabled(False)
+        self.sentence_label.setText("Generating an example sentence...")
+
+        thread = QThread(self)
+        worker = SentenceWorker(word, explanation, refresh=refresh)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._handle_sentence, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.sentence_thread = thread
+        self.sentence_worker = worker
+        self.sentence_context = (sentence_button, thread, worker)
+        thread.start()
+
+    @Slot(str, str)
+    def _handle_sentence(self, sentence: str, error: str) -> None:
+        context = getattr(self, "sentence_context", None)
+        if context is None:
+            return
+        sentence_button, thread, worker = context
+        if sentence:
+            clean_sentence = re.sub(r"\[\[|\]\]", "", sentence)
+            current_entry = self.practice_entries[self.practice_index]
+            self.practice_sentence_hints[current_entry] = clean_sentence
+            self.sentence_label.setText(self._highlight_tested_word(sentence, self.practice_word_display.text()))
+            sentence_button.setText("Refresh sentence")
+            sentence_button.setEnabled(True)
+        else:
+            self.sentence_label.setText(error)
+            sentence_button.setText("Sentence hint")
+            sentence_button.setEnabled(True)
+        thread.finished.connect(lambda: self._release_sentence_references(worker))
+        thread.quit()
+
+    @staticmethod
+    def _highlight_tested_word(sentence: str, word: str) -> str:
+        marked_match = re.search(r"\[\[([^\]]+)\]\]", sentence)
+        if marked_match:
+            return (
+                html.escape(sentence[:marked_match.start()])
+                + '<span style="background-color: #fff176; color: #20211f;">'
+                + html.escape(marked_match.group(1))
+                + "</span>"
+                + html.escape(sentence[marked_match.end():])
+            )
+
+        highlighted_parts: list[str] = []
+        last_end = 0
+        for match in re.finditer(re.escape(word), sentence, flags=re.IGNORECASE):
+            highlighted_parts.append(html.escape(sentence[last_end:match.start()]))
+            highlighted_parts.append(
+                '<span style="background-color: #fff176; color: #20211f;">'
+                f"{html.escape(match.group(0))}</span>"
+            )
+            last_end = match.end()
+        highlighted_parts.append(html.escape(sentence[last_end:]))
+        return "".join(highlighted_parts)
 
     @Slot(object, str)
     def _handle_judgment(self, correct: object, reason: str) -> None:
@@ -727,6 +914,8 @@ class SpreadsheetWindow(QMainWindow):
     ) -> None:
         if correct is None:
             answer_box.setReadOnly(False)
+            self.give_up_button.show()
+            self.sentence_button.show()
             answer_box.setStyleSheet("border: 2px solid #c85132;")
             ok_button.setText("Try again")
             ok_button.setEnabled(True)
@@ -834,6 +1023,7 @@ class SpreadsheetWindow(QMainWindow):
                 "Given up"
                 if entry in self.practice_given_up_entries
                 else f"{self.practice_error_counts[entry]} incorrect",
+                self.practice_sentence_hints.get(entry, ""),
             )
             for entry, count in self.practice_error_counts.items()
             if count > 0 or entry in self.practice_given_up_entries
@@ -847,14 +1037,26 @@ class SpreadsheetWindow(QMainWindow):
             f'<span style="color: #c85132;">{html.escape(entry[0])}</span> : unknown'
             for entry in self.practice_given_up_entries
         )
+        sentence_hints = "\n".join(
+            f"{html.escape(word)}: {html.escape(sentence)}"
+            for word, sentence in sorted(
+                (entry[0], sentence)
+                for entry, sentence in self.practice_sentence_hints.items()
+                if sentence
+            )
+        )
         report = f"Finished\n\n{statistics}"
         if given_up:
             report += f"\n\nGiven up\n{given_up}"
+        if sentence_hints:
+            report += f"\n\nSentence hints\n{sentence_hints}"
         self.practice_progress_label.hide()
         self.practice_word_label.hide()
         self.practice_word_display.hide()
+        self.sentence_label.hide()
         self.answer_box.hide()
         self.give_up_button.hide()
+        self.sentence_button.hide()
         self.ok_button.setText("Finish")
         self.ok_button.setEnabled(True)
         self.ok_button.setDefault(True)
@@ -872,6 +1074,9 @@ class SpreadsheetWindow(QMainWindow):
         self.export_count_checkbox = QCheckBox("Include incorrect count in export")
         self.export_count_checkbox.setChecked(True)
         self.export_count_checkbox.setStyleSheet("font: 14px 'Avenir Next';")
+        self.export_sentence_checkbox = QCheckBox("Include sentence hint in export")
+        self.export_sentence_checkbox.setChecked(True)
+        self.export_sentence_checkbox.setStyleSheet("font: 14px 'Avenir Next';")
         self.export_xlsx_button = QPushButton("Export .xlsx")
         self.export_xlsx_button.setObjectName("goButton")
         self.export_xlsx_button.clicked.connect(
@@ -884,22 +1089,26 @@ class SpreadsheetWindow(QMainWindow):
         )
         export_layout = QHBoxLayout()
         export_layout.addWidget(self.export_count_checkbox)
+        export_layout.addWidget(self.export_sentence_checkbox)
         export_layout.addStretch()
         export_layout.addWidget(self.export_xlsx_button)
         export_layout.addWidget(self.export_numbers_button)
         self.practice_layout.insertLayout(self.practice_layout.count() - 1, export_layout)
 
     def _export_entries(
-        self, entries: list[tuple[str, str, str]], extension: str
+        self, entries: list[tuple[str, str, str, str]], extension: str
     ) -> None:
         if not entries:
             self._show_standard_alert("Nothing to export", "No incorrect or given-up words.")
             return
 
         include_count = self.export_count_checkbox.isChecked()
+        include_sentence = self.export_sentence_checkbox.isChecked()
         headers = ["Words", "Chinese definitions"]
         if include_count:
             headers.append("Result")
+        if include_sentence:
+            headers.append("Sentence hint")
         default_name = f"STM-review{extension}"
         output_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -911,8 +1120,13 @@ class SpreadsheetWindow(QMainWindow):
             return
         output_path = str(Path(output_path).with_suffix(extension))
         rows = [
-            [word, definition, result] if include_count else [word, definition]
-            for word, definition, result in entries
+            [
+                word,
+                definition,
+                *([result] if include_count else []),
+                *([sentence] if include_sentence else []),
+            ]
+            for word, definition, result, sentence in entries
         ]
         try:
             if extension == ".xlsx":
@@ -930,6 +1144,8 @@ class SpreadsheetWindow(QMainWindow):
                 worksheet.column_dimensions["B"].width = 48
                 if include_count:
                     worksheet.column_dimensions["C"].width = 18
+                if include_sentence:
+                    worksheet.column_dimensions["D" if include_count else "C"].width = 64
                 workbook.save(output_path)
             else:
                 document = NumbersDocument(
@@ -972,6 +1188,12 @@ class SpreadsheetWindow(QMainWindow):
             self.answer_judge_worker = None
             self.answer_judge_thread = None
             self.answer_judge_context = None
+
+    def _release_sentence_references(self, worker: SentenceWorker) -> None:
+        if getattr(self, "sentence_worker", None) is worker:
+            self.sentence_worker = None
+            self.sentence_thread = None
+            self.sentence_context = None
 
     def _set_go_file_state(self, has_file: bool) -> None:
         self.go_button.setProperty("hasFile", has_file)
