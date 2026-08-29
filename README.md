@@ -1,7 +1,6 @@
 # Smart-Testing-of-Memorization-App
 
 English version: https://github.com/GeorgeXiong24/STM-app/blob/main/README.md
-
 Chinese version: https://github.com/GeorgeXiong24/STM-app/blob/main/README_cn.md
 
 For most English-Chinese word reciting or remembering app in the market currently, the word dictionary or word list is usually being limited or already being set up including a specific range. 
@@ -15,3 +14,5 @@ After a full testing, a report will be generated, demonstrating the number of ti
 Finally, to use this app, you can buy the DeepSeek API yourself, and enter the API into the input box at the start of the app interface. This allows the app to directly provoke the AI to function normally. More advanced functions are currently under development, please wait for them to come out. If there are any issues or bugs or suggestions for improvement, you are welcome to submit them in https://github.com/GeorgeXiong24/STM-app/issues.
 
 For downloading our app, please visit https://github.com/GeorgeXiong24/STM-app/releases. Thank you so much for using and supporting our app.
+
+Additionally, for macbook users, you may encounter some errors. In order to solve them, you can visit https://github.com/GeorgeXiong24/STM-app/blob/main/Mac_helper.md.

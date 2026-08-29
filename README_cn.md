@@ -1,7 +1,6 @@
 # Smart-Testing-of-Memorization-App
 
 英文版: https://github.com/GeorgeXiong24/STM-app/blob/main/README.md
-
 中文版: https://github.com/GeorgeXiong24/STM-app/blob/main/README_cn.md
 
 目前市场上大多数英汉单词背诵应用都采用固定或限定的单词词典或列表，而且形式基本上都是选择题，这就导致蒙对的几率比较高，从而降低了真正的掌握能力和效率。该应用则给予了用户进行自定义的权利：用户可以将自己的单词列表以 .xlsx 或 .numbers 格式上传到应用中。无论单词的排列或格式如何，AI都能自动识别这些单词及其对应的中文释义。
@@ -13,3 +12,5 @@
 最后，要使用此应用，您需要自行购买DeepSeek API，然后将其输入到应用开始界面的输入框中，这样应用就能直接让AI正常运作。更高级的功能正在开发中，请耐心等待。如果有任何问题、漏洞以及改进建议，欢迎在 https://github.com/GeorgeXiong24/STM-app/issues 中提交。
 
 如需下载该应用，请访问 https://github.com/GeorgeXiong24/STM-app/releases 。非常感谢您使用和支持我们的应用。
+
+此外，对于 MacBook用户来说，可能会遇到一些错误。要解决这些错误，可以访问 https://github.com/GeorgeXiong24/STM-app/blob/main/Mac_helper.md 。
