@@ -1,6 +1,7 @@
 # Smart-Testing-of-Memorization-App
 
 英文版: https://github.com/GeorgeXiong24/STM-app/blob/main/README.md
+
 中文版: https://github.com/GeorgeXiong24/STM-app/blob/main/README_cn.md
 
 目前市场上大多数英汉单词背诵应用都采用固定或限定的单词词典或列表，而且形式基本上都是选择题，这就导致蒙对的几率比较高，从而降低了真正的掌握能力和效率。该应用则给予了用户进行自定义的权利：用户可以将自己的单词列表以 .xlsx 或 .numbers 格式上传到应用中。无论单词的排列或格式如何，AI都能自动识别这些单词及其对应的中文释义。
