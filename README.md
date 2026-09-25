@@ -1,19 +1,65 @@
-# Smart-Testing-of-Memorization-App
+# STM — Smart Testing of Memorization
 
-English version: https://github.com/GeorgeXiong24/STM-app/blob/main/README.md
+> An AI-powered memorization tester that works with **your own** word lists.
 
-Chinese version: https://github.com/GeorgeXiong24/STM-app/blob/main/README_cn.md
+[English](README.md) · [中文](README_zh.md)
 
-For most English-Chinese word reciting or remembering app in the market currently, the word dictionary or word list is usually being limited or already being set up including a specific range. 
+## What is STM?
 
-This app is focusing on giving the capability of customization to users, where they are able to upload their own word list in .xlsx or .numbers format onto our app locally, and the words with their Chinese definitions can be recognized automatically by AI, no matter the arrangement or format.
+STM is a desktop app that tests how well you have memorized a list of vocabulary words. Instead of a fixed dictionary or multiple-choice questions, STM lets you bring your own word list and answer in your own words.
 
-Moreover, the Chinese definition of an English word may vary, almost never limited to a single one. Consequently, the way our app test how the user master those English words cannot simply compare users' input and the correct def demonstrated within the uploaded file. To solve this problem, we provoke the API of DeepSeek in order to help distinguishing whether the input definition is similar to the correct one, which provides a better experience for users.
+- Upload your own `.xlsx` or `.numbers` word list.
+- AI automatically recognizes each word and its Chinese definition, no matter how the list is arranged.
+- Because a word can have more than one valid meaning, AI judges whether your answer matches the meaning — not just the exact text.
+- After testing, you get a report of the words you missed or gave up on, which you can export for review.
 
-After a full testing, a report will be generated, demonstrating the number of times the users get each word incorrect or give up trying, which gives users the opportunity to get to know their current ability of mastering those words. Moreover, users are able to export the file containing the English words they got incorrect or given up, their Chinese definitions, and the users can decide whether the number of times the user got each word incorrect or given up will be displayed or not.
+## Supported languages
 
-Finally, to use this app, you can buy the DeepSeek API yourself, and enter the API into the input box at the start of the app interface. This allows the app to directly provoke the AI to function normally. More advanced functions are currently under development, please wait for them to come out. If there are any issues or bugs or suggestions for improvement, you are welcome to submit them in https://github.com/GeorgeXiong24/STM-app/issues.
+Words can be in any of these languages:
 
-For downloading our app, please visit https://github.com/GeorgeXiong24/STM-app/releases. Thank you so much for using and supporting our app.
+Chinese · French · German · Spanish · Italian · Portuguese · Japanese · Korean
 
-Additionally, for macbook users, you may encounter some errors. In order to solve them, you can visit https://github.com/GeorgeXiong24/STM-app/blob/main/Mac_helper.md.
+Definitions are shown and tested in **Chinese**.
+
+## How it works
+
+1. **Recognition** — When you upload a spreadsheet, STM asks the DeepSeek AI to identify each word and its Chinese definition, regardless of the column names or layout.
+2. **Judging** — During the test you type the definition in Chinese. The AI compares your answer to the reference meaning, accepting synonyms, natural paraphrases, and minor typos.
+3. **Review** — Words answered incorrectly are retested once more at the end.
+
+## Getting started
+
+1. Get a DeepSeek API key (it starts with `sk-`).
+2. Download the latest version from the [Releases](https://github.com/GeorgeXiong24/STM-app/releases) page.
+3. Open STM and paste your API key, then click **OK**.
+4. Choose the language of your words.
+5. Drop a `.xlsx` or `.numbers` file into the window, or use **File → Open…**.
+6. Review the recognized words and delete any rows you do not want.
+7. Click **Go** to start the test.
+8. For each word, type its Chinese definition and press **Enter** or click **OK**.
+9. When finished, review the report and export any words you missed.
+
+## The test
+
+- Each word gets two attempts.
+- Click **Give up** to skip a word you do not know.
+- Correct answers are filled in automatically.
+- Missed words are shown again in a final review round.
+
+## Exporting results
+
+After a test, export the incorrect or given-up words as `.xlsx` or `.numbers`, with an optional column showing how many times each word was missed.
+
+## Notes
+
+- Uploaded files are stored only temporarily and are removed when you close STM.
+- Press **Esc** to return to the previous screen.
+- On macOS, see the [Mac helper](https://github.com/GeorgeXiong24/STM-app/blob/main/Mac_helper.md) if you run into any issues.
+
+## Feedback
+
+Found a bug or have a suggestion? Open an issue in the [issue tracker](https://github.com/GeorgeXiong24/STM-app/issues).
+
+## Download
+
+Get the latest version from the [Releases](https://github.com/GeorgeXiong24/STM-app/releases) page.
