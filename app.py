@@ -104,6 +104,7 @@ TEST_LANGUAGES = (
     ("Korean", "한국어"),
 )
 SUPPORTED_LANGUAGES = {name for name, _ in TEST_LANGUAGES}
+DEFINITION_LANGUAGE = "Chinese"
 
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
@@ -463,12 +464,14 @@ class SpreadsheetWindow(QMainWindow):
         layout.setContentsMargins(180, 120, 180, 120)
         layout.setSpacing(18)
 
-        title = QLabel("Choose your testing language")
+        title = QLabel("Choose your vocabulary language")
         title.setObjectName("title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        subtitle = QLabel("Definitions will be shown and tested in this language.")
+        subtitle = QLabel(
+            f"Words will be shown in this language; definitions are shown and tested in {DEFINITION_LANGUAGE}."
+        )
         subtitle.setObjectName("subtitle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
@@ -712,7 +715,7 @@ class SpreadsheetWindow(QMainWindow):
         practice_layout.addWidget(word_display, 0, Qt.AlignmentFlag.AlignHCenter)
 
         answer_box = QLineEdit()
-        answer_box.setPlaceholderText(f"Enter the {self.test_language} definition")
+        answer_box.setPlaceholderText(f"Enter the {DEFINITION_LANGUAGE} definition")
         answer_box.setObjectName("answerBox")
         answer_box.setInputMethodHints(Qt.InputMethodHint.ImhNone)
         answer_box.setMinimumWidth(700)
@@ -772,7 +775,7 @@ class SpreadsheetWindow(QMainWindow):
         self.result_label.setText("Checking your answer...")
 
         thread = QThread(self)
-        worker = AnswerJudgeWorker(word, explanation, answer, self.test_language)
+        worker = AnswerJudgeWorker(word, explanation, answer, DEFINITION_LANGUAGE)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._handle_judgment, Qt.ConnectionType.QueuedConnection)
@@ -975,7 +978,7 @@ class SpreadsheetWindow(QMainWindow):
             return
 
         include_count = self.export_count_checkbox.isChecked()
-        headers = ["Words", f"{self.test_language} definitions"]
+        headers = ["Words", f"{DEFINITION_LANGUAGE} definitions"]
         if include_count:
             headers.append("Result")
         default_name = f"STM-review{extension}"
@@ -1105,16 +1108,11 @@ class SpreadsheetWindow(QMainWindow):
         model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
         target_language = self.test_language
         system_content = (
-            "Extract English vocabulary words and their definitions from the supplied "
-            "spreadsheet rows. Do not rely on column names or their language. Identify "
-            "the two fields by their actual content. Ignore titles, notes, numbering, "
-            "empty rows, and unrelated columns. "
-        )
-        if target_language == "Chinese":
-            system_content += "Return each definition in Chinese. "
-        else:
-            system_content += f"Translate each definition into {target_language}. "
-        system_content += (
+            f"Extract {target_language} vocabulary words and their definitions from the "
+            "supplied spreadsheet rows. Do not rely on column names or their language. "
+            "Identify the two fields by their actual content. Ignore titles, notes, "
+            "numbering, empty rows, and unrelated columns. "
+            f"Return each definition in {DEFINITION_LANGUAGE}. "
             "Return JSON only in the form {\"entries\":[{\"word\":\"...\","
             "\"definition\":\"...\"}]}. Keep the original word text."
         )
